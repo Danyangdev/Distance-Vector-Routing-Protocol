@@ -45,9 +45,19 @@ static int routing_content_size = 12;
  * @param  argv The argument list
  * @return 0 EXIT_SUCCESS
  */
+void main_loop();
 struct timeval tv_one_mimus_two(struct timeval tv1, struct timeval tv2);
+struct timeval tv_on_plus_two(struct timeval tv1, struct timeval tv2);
+void send_DISTANCE_VECTOR();
+void update_routing_table_UDP_receive_from_neighbor(int sock_index);
+ssize_t update_routing_table_UDP_send_to_neighbor(int sock_index, char* dv, uint32_t ip, uint16_t port, ssize_t length);
+int create_control_sock();
 int new_control_conn(int sock_index);
-
+int new_data_conn(int sock_index);
+bool isControl(int sock_index);
+bool isData(int sock_index);
+ssize_t recvALL(int sock_index, char *buffer, ssize_t nbytes);
+ssize_t sendALL(int sock_index, char *buffer, ssize_t nbytes);
 
 
 //定义当前host的各种信息
@@ -57,7 +67,8 @@ struct current_router{
 	uint16_t my_data_port;
 	uint16_t my_id;
 	uint16_t routers_number;
-	uint16_t time_period;
+	//定义路由器之间,更新路由表的时间间隔
+	uint16_t time_period_T;
 };
 struct current_router current_router;
 
@@ -75,14 +86,6 @@ struct __attribute__((__packed__)) Control_Response_Header {
     uint8_t control_code;
     uint8_t response_code;
     uint16_t payload_len;
-};
-
-struct __attribute__((__packed__)) Data_Header {
-    uint32_t dest_ip;
-    uint8_t transfer_id;
-    uint8_t ttl;
-    uint16_t seq_num;
-    uint32_t fin_padding;
 };
 
 //定义router header && data header
@@ -154,8 +157,6 @@ struct timeval next_send;
 struct timeval next_event;
 //读取control port
 uint16_t CONTROL_PORT;
-//定义路由器之间,更新路由表的时间间隔
-uint16_t time_period_T;
 //Infinity
 int INF = 65535;
 //储存所有的链接control socket,判断是否
@@ -192,7 +193,8 @@ int main(int argc, char **argv)
     main_loop();
     return 0;
 }
-
+//Timeout 只有一个T
+//Expired 有三个T
 void main_loop()
 {
 	//记录一次路由器的行为的开始时间
@@ -224,6 +226,7 @@ void main_loop()
 		std::cout<<"完成select的时刻:　"<<current_time.tv_sec<<"."<<current_time.tv_usec/100000<<"s"<<std::endl;
         if(selret < 0)
             ERROR("select failed.");
+		//处理超时或者断连情况
 		if(selret == 0){
 			std::cout<<"此时发生超时, 可能是超时或者是断连"<<std::endl;
 			gettimeofday(&current_time,NULL);
@@ -231,10 +234,10 @@ void main_loop()
 			//用当前时间-下一次更新路由表的时间
 			struct timeval time_difference = tv_one_mimus_two(current_time, next_send);
 			//如果这个时间差>0,但是有小于时间间隔,等于说是到达了更新的时刻,需要进行更新
-			if(time_difference.tv_sec<time_period_T &&(time_difference.tv_usec>=0 || time_difference.tv_usec>=0) ){
+			if(time_difference.tv_sec>=0 || (time_difference.tv_sec==0 && time_difference.tv_usec>=0)){
 				//开始更新
 				//第一步更新下次执行更新路由表的时刻 = 当前时刻 + 时间间隔(这个时间间隔将会在command中给出)
-				next_send.tv_sec=current_time.tv_sec+time_period_T;
+				next_send.tv_sec=current_time.tv_sec+current_router.time_period_T;
 				next_send.tv_usec = current_time.tv_usec;
 				std::cout<<"下次更新路由表的时刻:　"<<next_send.tv_sec<<"."<<next_send.tv_usec/100000<<"s"<<std::endl;
 				//这里要定义一个function来发送路由表到邻居
@@ -254,7 +257,7 @@ void main_loop()
 					//计算当前时间与3个T的超时时间的差
 					time_difference = tv_one_mimus_two(current_time,routers_timeout_list.at(i).expired_time);
 					//如果当前时间超过3T则断链接,设置距离为INF
-					if(time_difference.tv_sec>=0||time_difference.tv_usec>=0){
+					if(time_difference.tv_sec>=0||(time_difference.tv_usec>=0 && time_difference.tv_sec==0)){
 						//设置这个路由器与当前host的链接为0
 						routers_timeout_list.at(i).is_connected = 0;
 						//设置距离为INF, 遍历当前host的路由表,找到这个超时的路由器
@@ -266,10 +269,26 @@ void main_loop()
 								break;
 							}
 						}
+						//超过3T,断链,移除这个路由器
+						for(int c=0;c<neighbor_router_list.size();c++){
+							if(neighbor_router_list.at(c).neighbor_router_ID ==routers_timeout_list.at(i).router_ID){
+								close(neighbor_router_list.at(c).socket);
+								neighbor_router_list.erase(neighbor_router_list.begin()+c);
+							}
+						}
+					}else{
+						//等待时间与超时-当前时间的差
+						time_difference = tv_one_mimus_two(waiting_time,tv_one_mimus_two(routers_timeout_list.at(i).expired_time, current_time));
+						if(time_difference.tv_sec>=0 ||(time_difference.tv_usec>=0 && time_difference.tv_sec==0)){
+							waiting_time = tv_one_mimus_two(routers_timeout_list.at(i).expired_time, current_time);
+						}
 					}
 				}
 			}
-            if(FD_ISSET(sock_index, &watch_list)){
+			next_event = tv_on_plus_two(current_time, waiting_time);
+        }
+		for(sock_index = 0;sock_index<=head_fd;sock_index++){
+			if(FD_ISSET(sock_index, &watch_list)){
 				//控制器到路由器的链接
                 /* control_socket */
                 if(sock_index == control_socket){
@@ -286,8 +305,7 @@ void main_loop()
                 else if(sock_index == router_socket){
                     //call handler that will call recvfrom() .....
 					//如果是路由器socket,肯定是接受DV, 这里要通过这个socket,通过UDP的recvfrom读取路由表更新数据
-					update_routing_table_receive_from_neighbor(sock_index);
-
+					update_routing_table_UDP_receive_from_neighbor(sock_index);
                 }
 				//路由器到路由器关于传输数据建立TCP的链接
                 /* data_socket */
@@ -298,18 +316,17 @@ void main_loop()
 					FD_SET(fdaccept, &master_list);
 					if(fdaccept>head_fd) head_fd = fdaccept;
                 }
-
                 /* Existing connection */
                 else{
 					//如果在控制list中存在
                     if(isControl(sock_index)){
 						//控制平面的处理
-                        if(!control_recv_hook(sock_index)) FD_CLR(sock_index, &master_list);
+                        //if(!control_recv_hook(sock_index)) FD_CLR(sock_index, &master_list);
                     }
 					//如果在数据list中存在
                     else if (isData(sock_index)){
 						//数据平面的处理
-                        if (!data_recv_hook(sock_index)) FD_CLR(sock_index, &master_list);
+                        //if (!data_recv_hook(sock_index)) FD_CLR(sock_index, &master_list);
 					}
                     else ERROR("Unknown socket index");
                 }
@@ -324,18 +341,28 @@ void main_loop()
 					}
 				}
             }
-        }
+		}
     }
 }
 struct timeval tv_one_mimus_two(struct timeval tv1, struct timeval tv2) {
-    struct timeval tv_diff;
-    tv_diff.tv_sec = tv1.tv_sec - tv2.tv_sec;
-    tv_diff.tv_usec = tv1.tv_usec - tv2.tv_usec;
-    if (tv_diff.tv_usec < 0) {
-        tv_diff.tv_sec--;
-        tv_diff.tv_usec += 1000000;
+    struct timeval temp;
+    temp.tv_sec = tv1.tv_sec - tv2.tv_sec;
+    temp.tv_usec = tv1.tv_usec - tv2.tv_usec;
+    if (temp.tv_usec < 0) {
+        temp.tv_sec--;
+        temp.tv_usec += 1000000;
     }
-    return tv_diff;
+    return temp;
+}
+struct timeval tv_on_plus_two(struct timeval tv1, struct timeval tv2){
+    struct timeval temp;
+    temp.tv_sec = tv1.tv_sec + tv2.tv_sec;
+    temp.tv_usec = tv1.tv_usec + tv2.tv_usec;
+    if (temp.tv_usec > 1000000) {
+        temp.tv_sec++;
+        temp.tv_usec -= 1000000;
+    }
+    return temp;
 }
 void send_DISTANCE_VECTOR(){
 	char *distance_vector, *payload;
@@ -382,13 +409,13 @@ void send_DISTANCE_VECTOR(){
 	//现在路由表的数据已经完全放入distance_vector里面了
 	//因为可能周围的一些路由器发生了断连,所以不向所有路由器发送更新
 	for(int j=0; j<neighbor_router_list.size(); j++){
-		if(update_routing_table_UDP_to_neighbor(neighbor_router_list.at(j).socket,distance_vector, neighbor_router_list.at(j).neighbor_router_IP, neighbor_router_list.at(j).neighbor_router_PORT, data_size)<0){
+		if(update_routing_table_UDP_send_to_neighbor(neighbor_router_list.at(j).socket,distance_vector, neighbor_router_list.at(j).neighbor_router_IP, neighbor_router_list.at(j).neighbor_router_PORT, data_size)<0){
 			std::cout<<"成功发送"<<std::endl;
 		}
 	}
 }
 //如果是路由器socket,肯定是接受DV, 这里要通过这个socket,通过UDP的recvfrom读取路由表更新数据
-void update_routing_table_receive_from_neighbor(int sock_index){
+void update_routing_table_UDP_receive_from_neighbor(int sock_index){
 	char * payload;
 	struct sockaddr_in router_addr;
 	uint16_t num_to_update, source_router_port;
@@ -403,6 +430,7 @@ void update_routing_table_receive_from_neighbor(int sock_index){
 	int bit = 0;
 	int data_size = routing_header_size + routing_content_size*num_to_update;
 	payload = (char*)malloc(sizeof(char)*data_size);
+	//开始更新路由表
 	if(payload!=NULL){
 		if(recvfrom(sock_index, payload, (size_t)data_size,0,(struct sockaddr *)&router_addr, &addr_len)<0){
 			//UDP 接受失败
@@ -465,12 +493,50 @@ void update_routing_table_receive_from_neighbor(int sock_index){
 			}
 		}
 		//由当前路由表更新路由表的cost信息
-		//我操,这个点真他吗难想
+		//
+		for(int i=0;i<host_DV_table.size();i++){
+			if(host_DV_table.at(i).dest_ID!=current_router.my_id){
+				for(int j=0;j<host_DV_table.at(dest_router_index).dv_LIST.size(); j++){
+					if(host_DV_table.at(dest_router_index).dest_ID == host_DV_table.at(dest_router_index).dest_ID){
+						//更新cost
+						host_DV_table.at(i).dest_COST = host_DV_table.at(dest_router_index).dest_COST+host_DV_table.at(dest_router_index).dv_LIST.at(j).cost;
+						host_DV_table.at(i).next_hop_ID = dest_router_index;
+						for(int a=0;a<host_DV_table.size();a++){
+							if(!host_DV_table.at(a).dv_LIST.empty()){
+								for(int b=0;b<host_DV_table.at(a).dv_LIST.size();b++){
+									//判断如果新的cost小于原来的cost,则更新,否则不管这个更新
+									if(host_DV_table.at(i).dest_COST>host_DV_table.at(a).dest_COST+host_DV_table.at(a).dv_LIST.at(j).cost){
+										host_DV_table.at(i).dest_COST = host_DV_table.at(a).dest_COST+host_DV_table.at(a).dv_LIST.at(j).cost;
+										host_DV_table.at(i).next_hop_ID = host_DV_table.at(a).dest_ID;
+									}
+									break;
+								}
+							}
+						}
+						break;
+					}
+				}
+			}
+		}
 	}
+	//完成更新路由表
+	//开始更新接受路由器的超时表timeout list
+	struct timeval current_time;
+	gettimeofday(&current_time, NULL);
+	//三个时间周期超时
+	current_time.tv_sec+=3*current_router.time_period_T;
+	for(int i=0; i<routers_timeout_list.size();i++){
+		//找到对应的路由器, 设置这个路由器的超时时间
+		if(routers_timeout_list.at(i).router_ID == dest_router_index){
+			routers_timeout_list.at(i).expired_time = current_time;
+			routers_timeout_list.at(i).is_connected =1;
+			break;
+		}
+	}
+	
 }
-
 //UDP 常规操作
-ssize_t update_routing_table_UDP_to_neighbor(int sock_index, char* dv, uint32_t ip, uint16_t port, ssize_t length){
+ssize_t update_routing_table_UDP_send_to_neighbor(int sock_index, char* dv, uint32_t ip, uint16_t port, ssize_t length){
     ssize_t bytes = 0;
     struct sockaddr_in remote_router_addr;
     socklen_t addrlen = sizeof(remote_router_addr);
@@ -482,10 +548,8 @@ ssize_t update_routing_table_UDP_to_neighbor(int sock_index, char* dv, uint32_t 
     if (bytes == 0) return -1;
     return bytes;
 }
-
 //Sample code 常规操作Beej's socket那堆乱七八糟的
-int create_control_sock()
-{
+int create_control_sock(){
     int sock;
     struct sockaddr_in control_addr;
     socklen_t addrlen = sizeof(control_addr);
@@ -493,7 +557,8 @@ int create_control_sock()
     if(sock < 0)
         ERROR("socket() failed");
     /* Make socket re-usable */
-    if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (int[]){1}, sizeof(int)) < 0)
+    int temp =1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const void *) &temp, sizeof(temp)) < 0)
         ERROR("setsockopt() failed");
     bzero(&control_addr, sizeof(control_addr));
     control_addr.sin_family = AF_INET;
@@ -540,14 +605,16 @@ bool isControl(int sock_index) {
 
 //判断这个sock_index 是否属于data socket
 bool isData(int sock_index) {
-	std::vector<DATA_SOCKET>::iterator it = find(data_socket_list.begin(), data_socket_list.end(),sock_index);
-	return it != data_socket_list.end();
+    for (int i = 0; i < data_socket_list.size(); i++) {
+        if (data_socket_list[i].socket == sock_index) {
+            return true;
+        }
+    }
+    return false;
 }
 
-
 //TCP接收
-ssize_t recvALL(int sock_index, char *buffer, ssize_t nbytes)
-{
+ssize_t recvALL(int sock_index, char *buffer, ssize_t nbytes){
     ssize_t bytes = 0;
     bytes = recv(sock_index, buffer, nbytes, 0);
 
@@ -558,8 +625,7 @@ ssize_t recvALL(int sock_index, char *buffer, ssize_t nbytes)
     return bytes;
 }
 //TCP发送
-ssize_t sendALL(int sock_index, char *buffer, ssize_t nbytes)
-{
+ssize_t sendALL(int sock_index, char *buffer, ssize_t nbytes){
     ssize_t bytes = 0;
     bytes = send(sock_index, buffer, nbytes, 0);
 
@@ -569,3 +635,11 @@ ssize_t sendALL(int sock_index, char *buffer, ssize_t nbytes)
 
     return bytes;
 }
+
+
+
+
+
+
+
+
