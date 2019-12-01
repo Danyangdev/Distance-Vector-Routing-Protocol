@@ -286,7 +286,7 @@ void main_loop()
                 else if(sock_index == router_socket){
                     //call handler that will call recvfrom() .....
 					//如果是路由器socket,肯定是接受DV, 这里要通过这个socket,通过UDP的recvfrom读取路由表更新数据
-					update_routing_table(sock_index);
+					update_routing_table_receive_from_neighbor(sock_index);
 
                 }
 				//路由器到路由器关于传输数据建立TCP的链接
@@ -349,6 +349,7 @@ void send_DISTANCE_VECTOR(){
 	bzero(distance_vector, (size_t)data_size);
 	//初始化header
 	dv_header = (struct Route_Header *)(char *)malloc(sizeof(char) * routing_header_size);
+	//header的三个信息
 	dv_header->num_update = htons((uint16_t)num_to_update);
 	dv_header->source_ip = htons(current_router.my_ip);
 	dv_header->source_port = htons(current_router.my_router_port);
@@ -362,6 +363,7 @@ void send_DISTANCE_VECTOR(){
 	uint16_t table_router_port, table_router_id, table_router_cost;
 	uint32_t table_router_ip;
 	for(int i=0 ; i < num_to_update;i++){
+		//构成路由表信息
 		table_router_ip = htonl(host_DV_table.at(i).dest_IP);
 		table_router_port = htons(host_DV_table.at(i).dest_router_PORT);
 		table_router_id = htons(host_DV_table.at(i).dest_ID);
@@ -380,18 +382,95 @@ void send_DISTANCE_VECTOR(){
 	//现在路由表的数据已经完全放入distance_vector里面了
 	//因为可能周围的一些路由器发生了断连,所以不向所有路由器发送更新
 	for(int j=0; j<neighbor_router_list.size(); j++){
-		if(update_routing_table_UDP(neighbor_router_list.at(j).socket,distance_vector, neighbor_router_list.at(j).neighbor_router_IP, neighbor_router_list.at(j).neighbor_router_PORT, data_size)<0){
+		if(update_routing_table_UDP_to_neighbor(neighbor_router_list.at(j).socket,distance_vector, neighbor_router_list.at(j).neighbor_router_IP, neighbor_router_list.at(j).neighbor_router_PORT, data_size)<0){
 			std::cout<<"成功发送"<<std::endl;
 		}
 	}
 }
 //如果是路由器socket,肯定是接受DV, 这里要通过这个socket,通过UDP的recvfrom读取路由表更新数据
-void update_routing_table(int sock_inde){
-	
+void update_routing_table_receive_from_neighbor(int sock_index){
+	char * payload;
+	struct sockaddr_in router_addr;
+	uint16_t num_to_update, source_router_port;
+	uint16_t dest_router_id = INF;
+	uint32_t source_router_ip;
+	int dest_router_index;
+	socklen_t addr_len = sizeof(struct sockaddr_in);
+	router_addr.sin_family = AF_INET;
+    router_addr.sin_port = htons(current_router.my_router_port);
+    router_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	num_to_update = (uint16_t) host_DV_table.size();
+	int bit = 0;
+	int data_size = routing_header_size + routing_content_size*num_to_update;
+	payload = (char*)malloc(sizeof(char)*data_size);
+	if(payload!=NULL){
+		if(recvfrom(sock_index, payload, (size_t)data_size,0,(struct sockaddr *)&router_addr, &addr_len)<0){
+			//UDP 接受失败
+			return;
+		}
+		//成功接受
+		//解析header的三个信息
+		memcpy(&num_to_update, payload+bit, sizeof(num_to_update));
+		num_to_update = ntohs(num_to_update);
+		bit+=2;
+		memcpy(&source_router_port, payload+bit, sizeof(source_router_port));
+		source_router_port = ntohs(source_router_port);
+		bit+=2;
+		memcpy(&source_router_ip, payload+bit, sizeof(source_router_ip));
+		source_router_ip = ntohs(source_router_ip);
+		bit+=4;
+		//现在找哪个路由器是接受这个信息的
+		for(int i=0;i < host_DV_table.size();i++){
+			if(host_DV_table.at(i).dest_IP == source_router_ip){
+				//接受的路由器的ID
+				dest_router_id = host_DV_table.at(i).dest_ID;
+				//接受的路由器在路由表上的index
+				dest_router_index = i;
+				break;
+			}
+		}
+		//首先检查这个路由器是否是当前路由器的邻居,或者这个路由表中是否存在这个路由器
+		if( dest_router_index == INF || host_DV_table.at(dest_router_id).dest_COST == INF){
+			return;
+		}
+		//当前路由器存在,开始更新路由器的信息
+		//首先将这个接受更新的路由器的路由表清空
+		host_DV_table.at(dest_router_index).dv_LIST.clear();
+		//定义接受路由器的数据类型,并且开始解析payload,将数据放入其中并且遍历更新路由表
+		uint16_t dest_router_port, dest_router_id, dest_router_cost;
+		uint32_t dest_router_ip;
+		struct DISTANCE_VECTOR dv;
+		//开始解析payload
+		for(int i = 0;i<num_to_update;i++){
+			memcpy(&dest_router_ip, payload+bit, sizeof(dest_router_ip));
+			dest_router_ip = ntohl(dest_router_ip);
+			bit+=4;
+			memcpy(&dest_router_port,payload+bit, sizeof(dest_router_port));
+			dest_router_port = ntohs(dest_router_port);
+			bit+=2;
+			memcpy(&dest_router_id, payload+bit, sizeof(dest_router_id));
+			dest_router_id = ntohs(dest_router_id);
+			bit+=2;
+			memcpy(&dest_router_cost, payload+bit, sizeof(dest_router_cost));
+			dest_router_cost = ntohs(dest_router_cost);
+			bit+=2;
+			dv.dest_ID=dest_router_id;
+			dv.cost = dest_router_cost;
+			//解析完payload之后
+			//更新当前table(与当前路由器相链接的路由器)的接受路由表更新的路由器的路由表
+			host_DV_table.at(dest_router_index).dv_LIST.push_back(dv);
+			//如果更新的路由器是当前的路由器,则更新当前路由器到源路由器的cost
+			if(dest_router_id == current_router.my_id){
+				host_DV_table.at(dest_router_index).dest_COST = dest_router_cost;
+			}
+		}
+		//由当前路由表更新路由表的cost信息
+		//我操,这个点真他吗难想
+	}
 }
 
 //UDP 常规操作
-ssize_t update_routing_table_UDP(int sock_index, char* dv, uint32_t ip, uint16_t port, ssize_t length){
+ssize_t update_routing_table_UDP_to_neighbor(int sock_index, char* dv, uint32_t ip, uint16_t port, ssize_t length){
     ssize_t bytes = 0;
     struct sockaddr_in remote_router_addr;
     socklen_t addrlen = sizeof(remote_router_addr);
